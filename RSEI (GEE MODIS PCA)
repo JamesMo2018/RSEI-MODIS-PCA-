@@ -1,3 +1,15 @@
+Author: Lemeng LIU (Lemeng.Liu22@alumni.xjtlu.edu.cn; @Lemeng_Liu22)
+This code is free and open. 
+By using this code and any data derived with it, 
+you agree to cite the following reference 
+in any publications derived from them:
+Citation:
+Liu, L., Long, J., Zhang, W. et al. 
+Spatiotemporal evolution and driving factors of eco-environmental quality in the Beijing-Tianjin-Hebei urban agglomeration in China. 
+Scientific Reports 15, 25631 (2025). 
+DOI: https://doi.org/10.1038/s41598-025-11751-y
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 // 1. 数据源与ROI
 var MOD09A1 = ee.ImageCollection("MODIS/006/MOD09A1"),
     MOD11A2 = ee.ImageCollection("MODIS/006/MOD11A2"),
