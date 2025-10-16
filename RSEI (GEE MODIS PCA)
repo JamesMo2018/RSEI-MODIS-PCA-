@@ -1,0 +1,393 @@
+// 1. 数据源与ROI
+var MOD09A1 = ee.ImageCollection("MODIS/006/MOD09A1"),
+    MOD11A2 = ee.ImageCollection("MODIS/006/MOD11A2"),
+    MOD13A1 = ee.ImageCollection("MODIS/006/MOD13A1"),
+    roi = ee.FeatureCollection("users/lemengliu22studentxjtluedu/JJJ");
+ 
+Map.centerObject(roi);
+ 
+// 2. 云检测
+function cloudfree_mod09a1(image) {
+  var qa = image.select('StateQA');
+  var cloudState = qa.rightShift(0).bitwiseAnd(3);
+  var cloudShadowState = qa.rightShift(2).bitwiseAnd(1);
+  var cirrusState = qa.rightShift(8).bitwiseAnd(3);
+  var cloudMask = cloudState.or(cloudShadowState).or(cirrusState).eq(0);
+  return image.updateMask(cloudMask);
+}
+ 
+// 3. 年度时间范围
+var DateRG = ee.List([
+  ee.DateRange('2000-06-01','2000-08-31'),
+  ee.DateRange('2005-06-01','2005-08-31'),
+  ee.DateRange('2010-06-01','2010-08-31'),
+  ee.DateRange('2015-06-01','2015-08-31'),
+  ee.DateRange('2020-06-01','2020-08-31')
+]);
+var yearList = [2000, 2005, 2010, 2015, 2020];
+ 
+// 4. 四指标极值统计（合成所有年toBands，values+reduce最稳妥）
+function getWaterMask(dr) {
+  var mndwicol = MOD09A1.filterDate(dr).filterBounds(roi)
+    .map(cloudfree_mod09a1)
+    .map(function(image){
+      return image.normalizedDifference(['sur_refl_b04', 'sur_refl_b06']).rename('mndwi');
+    });
+  return mndwicol.mean().clip(roi).lt(0.2);
+}
+ 
+var NDVI_imgs = ee.ImageCollection(DateRG.map(function(dr){
+  var mask = getWaterMask(dr);
+  return MOD13A1.filterDate(dr).filterBounds(roi)
+    .mosaic().clip(roi)
+    .select('NDVI').multiply(0.0001).rename('ndvi')
+    .updateMask(mask);
+})).toBands();
+ 
+var LST_imgs = ee.ImageCollection(DateRG.map(function(dr){
+  var mask = getWaterMask(dr);
+  return MOD11A2.filterDate(dr).filterBounds(roi)
+    .mosaic().clip(roi)
+    .select('LST_Day_1km').multiply(0.02).subtract(273.15).rename('lst')
+    .updateMask(mask);
+})).toBands();
+ 
+var WET_imgs = ee.ImageCollection(DateRG.map(function(dr){
+  var mask = getWaterMask(dr);
+  var srIMG = MOD09A1.filterDate(dr).filterBounds(roi)
+    .map(cloudfree_mod09a1).mosaic().clip(roi);
+  return srIMG.select(0).multiply(0.1147)
+    .add(srIMG.select(1).multiply(0.2489))
+    .add(srIMG.select(2).multiply(0.2408))
+    .add(srIMG.select(3).multiply(0.3132))
+    .add(srIMG.select(4).multiply(-0.3122))
+    .add(srIMG.select(5).multiply(-0.6416))
+    .add(srIMG.select(6).multiply(-0.5087))
+    .multiply(0.0001).rename('wet')
+    .updateMask(mask);
+})).toBands();
+ 
+var NDBSI_imgs = ee.ImageCollection(DateRG.map(function(dr){
+  var mask = getWaterMask(dr);
+  var srIMG = MOD09A1.filterDate(dr).filterBounds(roi)
+    .map(cloudfree_mod09a1).mosaic().clip(roi);
+  var swir1 = srIMG.select(4);
+  var red   = srIMG.select(0);
+  var nir1  = srIMG.select(1);
+  var blue  = srIMG.select(2);
+  var green = srIMG.select(3);
+  var bi = swir1.add(red).subtract(nir1.add(blue)).divide(swir1.add(red).add(nir1.add(blue)));
+  var ibi = swir1.multiply(2).divide(swir1.add(nir1))
+    .subtract(nir1.divide(nir1.add(red)).add(green.divide(green.add(swir1))))
+    .divide(swir1.multiply(2).divide(swir1.add(nir1)).add(nir1.divide(nir1.add(red)).add(green.divide(green.add(swir1)))));
+  return bi.add(ibi).divide(2).rename('ndbsi').updateMask(mask);
+})).toBands();
+ 
+function getMinMax(imgs) {
+  return [
+    imgs.reduceRegion({reducer: ee.Reducer.min(), geometry: roi, scale: 1000, maxPixels: 1e13}).values().reduce(ee.Reducer.min()),
+    imgs.reduceRegion({reducer: ee.Reducer.max(), geometry: roi, scale: 1000, maxPixels: 1e13}).values().reduce(ee.Reducer.max())
+  ];
+}
+var ndviMinMax = getMinMax(NDVI_imgs);
+var lstMinMax = getMinMax(LST_imgs);
+var wetMinMax = getMinMax(WET_imgs);
+var ndbsiMinMax = getMinMax(NDBSI_imgs);
+ 
+// 5. 指标集合，统一极值归一化
+function GetIMG(dr){
+  var mask = getWaterMask(dr);
+ 
+  var rawNDVI = MOD13A1.filterDate(dr).filterBounds(roi)
+    .mosaic().clip(roi)
+    .select('NDVI').multiply(0.0001).rename('ndvi').updateMask(mask);
+  var NDVI = rawNDVI.unitScale(ndviMinMax[0], ndviMinMax[1]).clamp(0, 1);
+ 
+  var rawLST = MOD11A2.filterDate(dr).filterBounds(roi)
+    .mosaic().clip(roi)
+    .select('LST_Day_1km').multiply(0.02).subtract(273.15).rename('lst').updateMask(mask);
+  var LST = rawLST.unitScale(lstMinMax[0], lstMinMax[1]).clamp(0, 1);
+ 
+  var srIMG = MOD09A1.filterDate(dr).filterBounds(roi)
+    .map(cloudfree_mod09a1).mosaic().clip(roi);
+  var rawWET = srIMG.select(0).multiply(0.1147)
+    .add(srIMG.select(1).multiply(0.2489))
+    .add(srIMG.select(2).multiply(0.2408))
+    .add(srIMG.select(3).multiply(0.3132))
+    .add(srIMG.select(4).multiply(-0.3122))
+    .add(srIMG.select(5).multiply(-0.6416))
+    .add(srIMG.select(6).multiply(-0.5087))
+    .multiply(0.0001).rename('wet').updateMask(mask);
+  var WET = rawWET.unitScale(wetMinMax[0], wetMinMax[1]).clamp(0, 1);
+ 
+  var swir1 = srIMG.select(4);
+  var red   = srIMG.select(0);
+  var nir1  = srIMG.select(1);
+  var blue  = srIMG.select(2);
+  var green = srIMG.select(3);
+  var bi = swir1.add(red).subtract(nir1.add(blue)).divide(swir1.add(red).add(nir1.add(blue)));
+  var ibi = swir1.multiply(2).divide(swir1.add(nir1))
+    .subtract(nir1.divide(nir1.add(red)).add(green.divide(green.add(swir1))))
+    .divide(swir1.multiply(2).divide(swir1.add(nir1)).add(nir1.divide(nir1.add(red)).add(green.divide(green.add(swir1)))));
+  var rawNDBSI = bi.add(ibi).divide(2).rename('ndbsi').updateMask(mask);
+  var NDBSI = rawNDBSI.unitScale(ndbsiMinMax[0], ndbsiMinMax[1]).clamp(0, 1);
+ 
+  return ee.Image().addBands(NDVI)
+    .addBands(LST)
+    .addBands(WET)
+    .addBands(NDBSI)
+    .slice(1, 5);
+}
+var IndexCol = DateRG.map(GetIMG);
+print('IndexCol:', IndexCol);
+ 
+// 6. PCA
+function pca_full(image){  
+  var scale = 1000;
+  var bandNames = image.bandNames();
+  var region = roi;
+  var meanDict = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: region, scale: scale, maxPixels: 1e9
+  });
+  var means = ee.Image.constant(meanDict.values(bandNames));
+  var centered = image.subtract(means);
+  var getNewBandNames = function(prefix) {
+    var seq = ee.List.sequence(1, bandNames.length());
+    return seq.map(function(b) { return ee.String(prefix).cat(ee.Number(b).int()); });
+  };
+  var arrays = centered.toArray();
+  var covar = arrays.reduceRegion({
+    reducer: ee.Reducer.centeredCovariance(),
+    geometry: region, scale: scale, maxPixels: 1e9
+  });
+  var covarArray = ee.Array(covar.get('array'));
+  var eigens = covarArray.eigen();
+  var eigenValues = eigens.slice(1, 0, 1);
+  var eigenVectors = eigens.slice(1, 1);
+  var arrayImage = arrays.toArray(1);
+  var principalComponents = ee.Image(eigenVectors).matrixMultiply(arrayImage);
+  var sdImage = ee.Image(eigenValues.sqrt()).arrayProject([0]).arrayFlatten([getNewBandNames('sd')]);
+  var pcImage = principalComponents.arrayProject([0]).arrayFlatten([getNewBandNames('pc')]).divide(sdImage);
+  var eigenList = eigenValues.toList().flatten();
+  var total = eigenList.reduce(ee.Reducer.sum());
+  var percentageVariance = eigenList.map(function(item) {
+    return (ee.Number(item).divide(total)).multiply(100).format('%.2f');
+  });
+  return ee.Image(pcImage)
+    .set('eigenValues', eigenList)
+    .set('eigenVectors', eigenVectors)
+    .set('percentageVariance', percentageVariance);
+}
+var PCA_Results = ee.ImageCollection(IndexCol).map(pca_full);
+var PCA1_result = PCA_Results.select('pc1');
+print('PCA主分量集合:', PCA1_result);
+ 
+// 7. 打印PCA参数
+for (var j = 0; j < 5; j++) {
+  var pcaI = ee.Image(PCA_Results.toList(5).get(j));
+  print(yearList[j] + '年特征值:', pcaI.get('eigenValues'));
+  print(yearList[j] + '年特征向量:', pcaI.get('eigenVectors'));
+  print(yearList[j] + '年方差解释率:', pcaI.get('percentageVariance'));
+}
+ 
+// 8. RSEI标准化
+function sts_minmax(image){ 
+  var minmax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: roi,
+    scale: 1000,
+    maxPixels: 1e9
+  });
+  var min = ee.Number(minmax.values().reduce(ee.Reducer.min()));
+  var max = ee.Number(minmax.values().reduce(ee.Reducer.max()));
+  return [min, max];
+}
+function normlizedPCA1(image){
+  var minMax = sts_minmax(image);
+  return image.unitScale(minMax[0], minMax[1]).rename('rsei');
+}
+var RSEI = PCA1_result.map(normlizedPCA1);
+ 
+// 9. 生成带时间属性的RSEI
+var DateRG_start = DateRG.map(function(dr){ return ee.DateRange(dr).start(); });
+var zipRSEI = RSEI.toList(DateRG.length()).zip(DateRG_start);
+function setSystime(image){
+  var systime = ee.Date(ee.List(image).get(1)).advance(2,'month');
+  return ee.Image(ee.List(image).get(0)).set('system:time_start', systime);
+}
+var stimeRSEI = zipRSEI.map(setSystime);
+print('stimeRSEI', stimeRSEI);
+ 
+// 获取日期范围的开始日期
+var DateRG_start = DateRG.map(function(dr){ return ee.DateRange(dr).start();
+});
+var zipRSEI = RSEI.toList(DateRG.length()).zip(DateRG_start); // 将RSEI值与日期结合
+// 设置系统时间的函数
+function setSystime(image){
+  var systime = ee.Date(ee.List(image).get(1)).advance(2,'month'); // 时间向前推两个月
+  return ee.Image(ee.List(image).get(0)).set('system:time_start', systime); // 设置影像的时间属性
+  }
+// 设置影像的时间
+var stimeRSEI = zipRSEI.map(setSystime);
+Map.addLayer(ee.Image(stimeRSEI.get(4)), {min: 0, max: 1, palette: 'FFFFFF, CE7E45, DF923D, F1B555, FCD163, 99B718, 74A901, 66A000, 529400,' +
+        '3E8601, 207401, 056201, 004C00, 023B01, 012E01, 011D01, 011301'}, 'rsei'); // 显示某一影像层
+print(stimeRSEI, 'stimeRSEI'); // 打印结果
+// 图表选项定义
+var options = {
+  width: 400,
+  height: 240,
+  legend: {position: 'top',
+  textStyle: {color: 'blue', fontSize: 16}},
+  lineWidth: 1,
+  pointSize: 5,
+  vAxis: {
+    title: RSEI
+    },
+    trendlines: {
+      0: {
+        type: 'linear',
+        color: 'red',
+        lineWidth: 1,
+        opacity: 0.8,
+        showR2: true,
+        visibleInLegend: true
+        }
+        },
+        title: 'Timeserise RSEI',};
+        
+// 创建区域平均值图表
+var RSEImean = ui.Chart.image.seriesByRegion({
+  imageCollection: stimeRSEI, // 使用时间序列RSEI
+  regions: roi, // 指定区域
+  reducer: ee.Reducer.mean(), // 使用均值作为聚合方法
+  scale: 1000,
+  seriesProperty: "RSEI"}).setOptions(options);
+print(RSEImean, 'RSEImean'); // 打印图表
+ 
+// 将影像集合转换为波段
+var stimeRSEIbands = ee.ImageCollection(stimeRSEI).toBands();
+print(stimeRSEIbands, 'stimeRSEIbands'); // 打印结果
+ 
+// 10. 导出影像
+for (var j = 0; j < 5; j++) {
+  Export.image.toDrive({
+    image: ee.Image(stimeRSEI.get(j)),
+    description: 'RSEI_' + yearList[j],
+    scale: 1000,
+    region: roi,
+    fileFormat: 'GeoTIFF',
+    folder: 'RSEI',
+    maxPixels: 1e13,
+    crs: "EPSG:4326"
+  });
+  var ndvi = ee.Image(IndexCol.get(j)).select('ndvi');
+  var lst = ee.Image(IndexCol.get(j)).select('lst');
+  var wet = ee.Image(IndexCol.get(j)).select('wet');
+  var ndbsi = ee.Image(IndexCol.get(j)).select('ndbsi');
+  Export.image.toDrive({
+    image: ndvi,
+    description: 'NDVI_' + yearList[j],
+    scale: 1000,
+    region: roi,
+    fileFormat: 'GeoTIFF',
+    folder: 'RSEI_Indicators',
+    maxPixels: 1e13,
+    crs: "EPSG:4326"
+  });
+  Export.image.toDrive({
+    image: lst,
+    description: 'LST_' + yearList[j],
+    scale: 1000,
+    region: roi,
+    fileFormat: 'GeoTIFF',
+    folder: 'RSEI_Indicators',
+    maxPixels: 1e13,
+    crs: "EPSG:4326"
+  });
+  Export.image.toDrive({
+    image: wet,
+    description: 'WET_' + yearList[j],
+    scale: 1000,
+    region: roi,
+    fileFormat: 'GeoTIFF',
+    folder: 'RSEI_Indicators',
+    maxPixels: 1e13,
+    crs: "EPSG:4326"
+  });
+  Export.image.toDrive({
+    image: ndbsi,
+    description: 'NDBSI_' + yearList[j],
+    scale: 1000,
+    region: roi,
+    fileFormat: 'GeoTIFF',
+    folder: 'RSEI_Indicators',
+    maxPixels: 1e13,
+    crs: "EPSG:4326"
+  });
+}
+ 
+// 11. 统计均值表导出
+var indicatorNames = ['ndvi', 'lst', 'wet', 'ndbsi'];
+var meanList = [];
+for (var j = 0; j < 5; j++) {
+  var img = ee.Image(IndexCol.get(j));
+  var year = yearList[j];
+  var row = [year];
+  for (var i = 0; i < indicatorNames.length; i++) {
+    var mean = img.select(indicatorNames[i]).reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: roi,
+      scale: 1000,
+      maxPixels: 1e13
+    }).get(indicatorNames[i]);
+    row.push(mean);
+  }
+  meanList.push(row);
+}
+var meanFC = ee.FeatureCollection(meanList.map(function(row){
+  return ee.Feature(null, {
+    'year': row[0],
+    'NDVI_mean': row[1],
+    'LST_mean': row[2],
+    'WET_mean': row[3],
+    'NDBSI_mean': row[4]
+  });
+}));
+Export.table.toDrive({
+  collection: meanFC,
+  description: 'RSEI_Indicators_Mean_Table',
+  fileFormat: 'CSV',
+  folder: 'RSEI_Indicators'
+});
+ 
+// 12. PCA参数全部导出
+var pcaTable = ee.FeatureCollection(
+  yearList.map(function(y, i) {
+    var thisPCA = ee.Image(PCA_Results.toList(5).get(i));
+    var eigVals = ee.List(thisPCA.get('eigenValues'));
+    var eigPer = ee.List(thisPCA.get('percentageVariance'));
+    var eigVecs = ee.Array(thisPCA.get('eigenVectors'));
+    return ee.Feature(null, {
+      'year': y,
+      'eigVal_1': eigVals.get(0),
+      'eigVal_2': eigVals.get(1),
+      'eigVal_3': eigVals.get(2),
+      'eigVal_4': eigVals.get(3),
+      'perVar_1': eigPer.get(0),
+      'perVar_2': eigPer.get(1),
+      'perVar_3': eigPer.get(2),
+      'perVar_4': eigPer.get(3),
+      'PC1_ndvi': eigVecs.get([0,0]),
+      'PC1_lst': eigVecs.get([1,0]),
+      'PC1_wet': eigVecs.get([2,0]),
+      'PC1_ndbsi': eigVecs.get([3,0])
+    });
+  })
+);
+Export.table.toDrive({
+  collection: pcaTable,
+  description: 'RSEI_PCA_Params_Table',
+  fileFormat: 'CSV',
+  folder: 'RSEI_PCA_Params'
+});
